@@ -1,0 +1,58 @@
+name: AURA One - Backup criptografado
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 12 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: aura-one-database-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.AURA_BACKUP_DATABASE_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AURA_BACKUP_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AURA_BACKUP_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AURA_BACKUP_AWS_REGION }}
+      BACKUP_BUCKET: ${{ secrets.AURA_BACKUP_BUCKET }}
+      AGE_RECIPIENT: ${{ vars.AURA_BACKUP_AGE_RECIPIENT }}
+    steps:
+      - name: Validar configuração obrigatória
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in DATABASE_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION BACKUP_BUCKET AGE_RECIPIENT; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::notice::Backup não executado: configuração $name ausente."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Instalar age
+        if: steps.config.outputs.ready == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y age
+      - name: Gerar dump e criptografar imediatamente
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          filename="aura-one-${timestamp}.dump.age"
+          # pg_dump writes only to a pipe, never to an unencrypted file.
+          docker run --rm --network host -e DATABASE_URL postgres:17             sh -c 'exec pg_dump --dbname="$DATABASE_URL" --format=custom --no-owner --no-acl'             | age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/$filename"
+          test -s "$RUNNER_TEMP/$filename"
+          sha256sum "$RUNNER_TEMP/$filename" | sed "s|$RUNNER_TEMP/||" > "$RUNNER_TEMP/$filename.sha256"
+          aws s3 cp "$RUNNER_TEMP/$filename" "s3://$BACKUP_BUCKET/aura-one/$filename" --sse AES256 --no-progress
+          aws s3 cp "$RUNNER_TEMP/$filename.sha256" "s3://$BACKUP_BUCKET/aura-one/$filename.sha256" --sse AES256 --no-progress
+          echo "Backup criptografado enviado ao armazenamento privado."
+      - name: Falhar se configuração ausente em execução manual
+        if: github.event_name == 'workflow_dispatch' && steps.config.outputs.ready != 'true'
+        run: |
+          echo "::error::Configure secrets e variável de criptografia antes do primeiro backup."
+          exit 1
