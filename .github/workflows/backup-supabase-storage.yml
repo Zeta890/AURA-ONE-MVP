@@ -1,0 +1,56 @@
+name: AURA One - Backup criptografado Supabase Storage
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 12 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: aura-one-supabase-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.AURA_BACKUP_DATABASE_URL }}
+      SUPABASE_URL: ${{ vars.AURA_BACKUP_SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.AURA_BACKUP_SUPABASE_SERVICE_KEY }}
+      AGE_RECIPIENT: ${{ vars.AURA_BACKUP_AGE_RECIPIENT }}
+    steps:
+      - name: Verificar configuração
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in DATABASE_URL SUPABASE_URL SUPABASE_SERVICE_KEY AGE_RECIPIENT; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Configuração obrigatória ausente: $name"
+              exit 1
+            fi
+          done
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Instalar age
+        run: sudo apt-get update -qq && sudo apt-get install -y age
+      - name: Exportar, criptografar e enviar ao bucket privado
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          filename="aura-one-$(date -u +%Y%m%dT%H%M%SZ).dump.age"
+          docker run --rm --network host -e DATABASE_URL postgres:17 \
+            sh -c 'exec pg_dump --dbname="$DATABASE_URL" --format=custom --no-owner --no-acl' \
+            | age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/$filename"
+          test -s "$RUNNER_TEMP/$filename"
+          size=$(stat -c%s "$RUNNER_TEMP/$filename")
+          if (( size > 52428800 )); then
+            echo "::error::Arquivo criptografado excede limite de 50 MiB do bucket."
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            -X POST "${SUPABASE_URL%/}/storage/v1/object/aura-private-backups/$filename" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$RUNNER_TEMP/$filename" > /dev/null
+          echo "Backup criptografado enviado ao bucket privado: $filename"
